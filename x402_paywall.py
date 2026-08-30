@@ -464,6 +464,14 @@ async def _run_completion(request, *, tier: str, default_model: str,
     if trial_resp is not None:
         return trial_resp  # 400/401/402 trial rejection
     # ── paid path ──
+    # Per-wallet daily usage caps (owner policy: no unbounded GPU extraction).
+    # Enforced after payment verification, before model execution — an
+    # over-cap call returns 429 and settles nothing (caller never charged).
+    from x402_usage_caps import payer_from_header, check_and_count
+    payer = payer_from_header(request.headers.get("x-payment"))
+    allowed, rejection = check_and_count(payer, max_tokens)
+    if not allowed:
+        return JSONResponse(rejection, status_code=429)
     result = await _complete(prompt, department, max_tokens, tier, default_model)
     if result.get("status_code"):
         return JSONResponse({"error": result["error"]}, status_code=result["status_code"])
