@@ -33,14 +33,14 @@ log = logging.getLogger("x402_paywall")
 
 BASE_DIR = Path(__file__).resolve().parent
 VAULT_WALLET = BASE_DIR / "vault" / "x402_receive_wallet.age"
-AGE_IDENTITY = Path("~/.age/key.txt")
+AGE_IDENTITY = Path("/home/diomedes/.vault/keys/diomedes_age.key")
 
 # MAINNET (eip155:8453) via SELF-HOSTED facilitator (x402_facilitator.py, :8402).
 # Hosted x402.org is EVM-testnet-only. Testnet fallback: NETWORK="eip155:84532",
 # FACILITATOR_URL="https://x402.org/facilitator".
 NETWORK = "eip155:8453"            # Base mainnet
 PRICE_USD = "0.01"                 # standard completion
-PRICE_DEEP_USD = "0.05"            # deep: more tokens + smart routing
+PRICE_DEEP_USD = "0.05"            # deep: bigger budget (8K tokens), local-only
 PRICE_VL_USD = "0.10"              # vision-language (Qwen3-VL 30B swap)
 FACILITATOR_URL = "http://127.0.0.1:8402"
 PREMIUM_ROUTE = "/premium/llm"
@@ -225,7 +225,7 @@ def build_premium_middleware():
             "output": {"type": "application/json", "example": {"text": "...", "model_tier": "premium", "elapsed_s": 1.7}},
         }),
         f"POST {PREMIUM_DEEP_ROUTE}": _accept(pay_to, PRICE_DEEP_USD, {
-            "description": "Deep tier — 8K tokens, smart routing to frontier models when warranted",
+            "description": "Deep tier — 8K tokens, 27B local model, double the thinking budget",
             "mimeType": "application/json",
             "input": {
                 "type": "http",
@@ -242,7 +242,7 @@ def build_premium_middleware():
                     "required": ["prompt"],
                 },
             },
-            "output": {"type": "application/json", "example": {"text": "...", "model_tier": "deep", "routing": "auto_frontier"}},
+            "output": {"type": "application/json", "example": {"text": "...", "model_tier": "deep"}},
         }),
         f"POST {PREMIUM_VL_ROUTE}": _accept(pay_to, PRICE_VL_USD, {
             "description": "Vision tier — Qwen3-VL 30B analyzes an image URL",
@@ -333,8 +333,30 @@ async def _complete(prompt: str, department: str, max_tokens: int,
     """Shared completion core — returns a plain dict, no HTTP wrapper.
 
     On failure returns {"error": ..., "status_code": int}.
+
+    OWNER POLICY (2026-08-30): no cloud fallback for external buyers. If the
+    local GPU (vLLM) is down/parked, every paid tier refuses — we never spend
+    paid cloud quota on behalf of external wallets. vLLM is probed directly
+    (not via the hub router, which would silently route to cloud).
     """
     from server import llm_complete_hub
+
+    if default_model in ("auto", None) or default_model != "local":
+        default_model = "local"  # force local-only for ALL external tiers
+
+    vllm_up = False
+    try:
+        import httpx as _hx
+        async with _hx.AsyncClient(timeout=3.0) as client:
+            r = await client.get("http://localhost:8001/health")
+        vllm_up = (r.status_code == 200)
+    except Exception:
+        vllm_up = False
+    if not vllm_up:
+        return {
+            "error": "service temporarily unavailable — local model offline (you were not charged)",
+            "status_code": 503,
+        }
 
     t0 = time.time()
     try:
@@ -456,7 +478,7 @@ async def _run_completion(request, *, tier: str, default_model: str,
 
 
 async def deep_llm_handler(request):
-    """$0.05 tier: 8K token cap + model='auto' (smart local/frontier routing)."""
+    """$0.05 tier: 8K token cap, local 27B only (owner policy: no cloud for external buyers)."""
     return await _run_completion(
         request, tier="deep", default_model="auto",
         tokens_cap=PREMIUM_DEEP_TOKENS_CAP, default_tokens=4000,
@@ -504,7 +526,17 @@ async def trial_handler(request):
 
     admitted, trial_resp = check_free_trial(body, None)
     if not admitted:
-        return trial_resp  # None-auth rejection (400/401/402) — never None here
+        # trial_resp is None when the request carried no trial_auth at all —
+        # that is NOT a trial attempt, and falling through would give away a
+        # free completion with no wallet signature and no payment. Require it.
+        if trial_resp is None:
+            return JSONResponse({
+                "error": "trial requires trial_auth: sign the domain message with your wallet",
+                "domain": TRIAL_DOMAIN,
+                "expected_body": {"prompt": "...", "trial_auth": {"wallet": "0x...", "signature": "0x...", "message": f"...{TRIAL_DOMAIN}..."}},
+                "or_pay": "POST /premium/llm with an x402 X-PAYMENT header ($0.01)",
+            }, status_code=402)
+        return trial_resp  # 400/401 trial rejection with explanation
 
     full_prompt = f"{prompt}\n\n[image: {body.get('image_url')}]" if tier == "vl" else prompt
     import hmac as _hmac

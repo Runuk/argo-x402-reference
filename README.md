@@ -10,7 +10,7 @@ model runs; settlement happens *after* — a failed request is never charged.
 
 ```
 $0.01  POST /premium/llm    27B open-weights model, 4K token cap
-$0.05  POST /premium/deep   8K tokens, smart-routes to a frontier model when warranted
+$0.05  POST /premium/deep   8K tokens — double the thinking budget on the same 27B
 $0.10  POST /premium/vl     30B vision model, image understanding
 free   GET  /premium/balance  live on-chain earnings (transparency endpoint)
 free   POST /premium/trial    3 calls per wallet, sybil-limited by EIP-191 signature
